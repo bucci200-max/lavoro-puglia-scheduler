@@ -72,6 +72,8 @@ jobs:
 
       - name: Verifica configurazione e permessi bot (sola lettura, solo avvio manuale)
         if: github.event_name == 'workflow_dispatch'
+        # Diagnostica: un problema Telegram non deve impedire il collaudo della raccolta.
+        continue-on-error: true
         working-directory: pipeline
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
