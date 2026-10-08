@@ -1,0 +1,112 @@
+# Lavoro Puglia — scheduler pubblico (solo orchestrazione).
+# Il codice della pipeline è nel repository privato bucci200-max/lavoro-puglia-pipeline,
+# letto con una deploy key in sola lettura. Repository pubblico = minuti dei
+# runner standard gratuiti. I log sono pubblici: la CLI oscura ogni credenziale.
+name: Lavoro Puglia pipeline
+
+on:
+  schedule:
+    # ~ogni 15 minuti dalle 07 alle 21 (ora italiana, UTC+2/+1), ogni 2 ore di notte.
+    # GitHub può ritardare o saltare esecuzioni: la pipeline recupera dal database.
+    - cron: '7,22,37,52 5-19 * * *'
+    - cron: '7 21,23,1,3 * * *'
+    # Una volta a settimana mantiene attiva la pianificazione (60 giorni senza attività la disattivano).
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Modalità (vuoto = variabile PIPELINE_MODE). live pubblica su Telegram.'
+        type: choice
+        options: ['', 'dry-run', 'collect', 'live']
+        default: ''
+
+permissions:
+  contents: read
+  actions: write # solo per riattivare la pianificazione (keepalive)
+
+concurrency:
+  group: lavoro-puglia-pipeline
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    # Le esecuzioni pianificate partono solo quando la pipeline è attivata
+    # (PIPELINE_MODE = collect | live); i collaudi si avviano a mano.
+    if: github.event_name != 'schedule' || vars.PIPELINE_MODE == 'collect' || vars.PIPELINE_MODE == 'live'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      PIPELINE_MODE: ${{ inputs.mode || vars.PIPELINE_MODE || 'dry-run' }}
+    steps:
+      - name: Checkout pipeline (privato, deploy key in sola lettura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: bucci200-max/lavoro-puglia-pipeline
+          ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: pipeline
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: pipeline/package-lock.json
+
+      - name: Dipendenze
+        working-directory: pipeline
+        run: npm ci --no-audit --no-fund
+
+      - name: Font per le schede (Arial → Liberation Sans)
+        run: |
+          if ! fc-match Arial | grep -qi liberation; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq fonts-liberation
+          fi
+          fc-match Arial
+
+      - name: Stato esecuzioni precedenti
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: pipeline/.state
+          key: run-state-${{ github.run_id }}
+          restore-keys: run-state-
+
+      - name: Pipeline
+        working-directory: pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
+          XKIRO_API_KEY: ${{ secrets.XKIRO_API_KEY }}
+          TELEGRAM_PUBLIC_CHANNEL: lavoropuglia26
+          PIPELINE_OWNER: github-actions
+          # Avvio manuale: esito rosso a ogni errore. Pianificato: rosso solo quando
+          # scatta l'avviso (3 fallimenti consecutivi, poi max 1 al giorno).
+          PIPELINE_STRICT: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npx tsx functions/cli.ts run --budget-seconds 540 --max-publish 6
+
+      - name: Salva stato esecuzioni
+        if: always()
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: pipeline/.state
+          key: run-state-${{ github.run_id }}
+
+      - name: Scheda di prova (solo dry-run manuale)
+        if: github.event_name == 'workflow_dispatch' && env.PIPELINE_MODE == 'dry-run'
+        working-directory: pipeline
+        run: npx tsx functions/cli.ts card --out card-preview/scheda-prova.png
+
+      - name: Pubblica scheda di prova
+        if: github.event_name == 'workflow_dispatch' && env.PIPELINE_MODE == 'dry-run'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scheda-prova
+          path: pipeline/card-preview/scheda-prova.png
+          retention-days: 3
+
+      - name: Mantieni attiva la pianificazione
+        if: github.event_name == 'schedule' && github.event.schedule == '41 4 * * 1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/pipeline.yml/enable"
