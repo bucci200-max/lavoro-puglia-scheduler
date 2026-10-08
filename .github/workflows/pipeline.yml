@@ -70,6 +70,16 @@ jobs:
           key: run-state-${{ github.run_id }}
           restore-keys: run-state-
 
+      - name: Verifica configurazione e permessi bot (sola lettura, solo avvio manuale)
+        if: github.event_name == 'workflow_dispatch'
+        working-directory: pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          XKIRO_API_KEY: ${{ secrets.XKIRO_API_KEY }}
+        run: npx tsx functions/cli.ts check
+
       - name: Pipeline
         working-directory: pipeline
         env:
@@ -80,6 +90,8 @@ jobs:
           XKIRO_API_KEY: ${{ secrets.XKIRO_API_KEY }}
           TELEGRAM_PUBLIC_CHANNEL: lavoropuglia26
           PIPELINE_OWNER: github-actions
+          # Analisi testuale xKiro: spenta salvo PIPELINE_AI=on (le immagini non usano mai xKiro).
+          PIPELINE_AI: ${{ vars.PIPELINE_AI || 'off' }}
           # Avvio manuale: esito rosso a ogni errore. Pianificato: rosso solo quando
           # scatta l'avviso (3 fallimenti consecutivi, poi max 1 al giorno).
           PIPELINE_STRICT: ${{ github.event_name == 'workflow_dispatch' }}
