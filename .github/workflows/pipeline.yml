@@ -4,10 +4,12 @@
 # runner standard gratuiti. I log sono pubblici: la CLI oscura ogni credenziale.
 name: Lavoro Puglia pipeline
 
+# Cadenza: ogni ciclo, al termine, avvia il successivo (workflow_dispatch con il token
+# del workflow). L'attesa la fa un environment con timer — "cadenza-giorno" 12 min,
+# "cadenza-notte" 110 min — senza runner acceso. Il cron di GitHub, che può ritardare o
+# saltare esecuzioni, resta solo come rete di sicurezza per riavviare la catena.
 on:
   schedule:
-    # ~ogni 15 minuti dalle 07 alle 21 (ora italiana, UTC+2/+1), ogni 2 ore di notte.
-    # GitHub può ritardare o saltare esecuzioni: la pipeline recupera dal database.
     - cron: '7,22,37,52 5-19 * * *'
     - cron: '7 21,23,1,3 * * *'
     # Una volta a settimana mantiene attiva la pianificazione (60 giorni senza attività la disattivano).
@@ -19,24 +21,45 @@ on:
         type: choice
         options: ['', 'dry-run', 'collect', 'live']
         default: ''
+      chained:
+        description: 'Uso interno: ciclo avviato dal ciclo precedente'
+        type: boolean
+        default: false
+      cadence:
+        description: 'Uso interno: giorno | notte'
+        type: string
+        default: 'giorno'
 
 permissions:
   contents: read
-  actions: write # solo per riattivare la pianificazione (keepalive)
+  actions: write # avviare il ciclo successivo e riattivare la pianificazione
+  deployments: write # attesa tramite environment
 
 concurrency:
   group: lavoro-puglia-pipeline
   cancel-in-progress: false
 
 jobs:
+  attesa:
+    if: inputs.chained && (vars.PIPELINE_MODE == 'collect' || vars.PIPELINE_MODE == 'live')
+    runs-on: ubuntu-24.04
+    environment: ${{ inputs.cadence == 'notte' && 'cadenza-notte' || 'cadenza-giorno' }}
+    timeout-minutes: 2
+    steps:
+      - run: echo "Attesa completata, avvio del ciclo"
+
   pipeline:
-    # Le esecuzioni pianificate partono solo quando la pipeline è attivata
-    # (PIPELINE_MODE = collect | live); i collaudi si avviano a mano.
-    if: github.event_name != 'schedule' || vars.PIPELINE_MODE == 'collect' || vars.PIPELINE_MODE == 'live'
+    needs: attesa
+    # Automatico (cron o catena) solo con PIPELINE_MODE = collect | live; i collaudi si avviano a mano.
+    if: >-
+      always() && (needs.attesa.result == 'success' || needs.attesa.result == 'skipped') &&
+      ((github.event_name == 'workflow_dispatch' && !inputs.chained) ||
+       vars.PIPELINE_MODE == 'collect' || vars.PIPELINE_MODE == 'live')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       PIPELINE_MODE: ${{ inputs.mode || vars.PIPELINE_MODE || 'dry-run' }}
+      MANUAL: ${{ github.event_name == 'workflow_dispatch' && !inputs.chained }}
     steps:
       - name: Checkout pipeline (privato, deploy key in sola lettura)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,7 +94,7 @@ jobs:
           restore-keys: run-state-
 
       - name: Verifica configurazione e permessi bot (sola lettura, solo avvio manuale)
-        if: github.event_name == 'workflow_dispatch'
+        if: env.MANUAL == 'true'
         # Diagnostica: un problema Telegram non deve impedire il collaudo della raccolta.
         continue-on-error: true
         working-directory: pipeline
@@ -96,7 +119,7 @@ jobs:
           PIPELINE_AI: ${{ vars.PIPELINE_AI || 'off' }}
           # Avvio manuale: esito rosso a ogni errore. Pianificato: rosso solo quando
           # scatta l'avviso (3 fallimenti consecutivi, poi max 1 al giorno).
-          PIPELINE_STRICT: ${{ github.event_name == 'workflow_dispatch' }}
+          PIPELINE_STRICT: ${{ env.MANUAL }}
         run: npx tsx functions/cli.ts run --budget-seconds 540 --max-publish 6
 
       - name: Salva stato esecuzioni
@@ -107,12 +130,12 @@ jobs:
           key: run-state-${{ github.run_id }}
 
       - name: Scheda di prova (solo dry-run manuale)
-        if: github.event_name == 'workflow_dispatch' && env.PIPELINE_MODE == 'dry-run'
+        if: env.MANUAL == 'true' && env.PIPELINE_MODE == 'dry-run'
         working-directory: pipeline
         run: npx tsx functions/cli.ts card --out card-preview/scheda-prova.png
 
       - name: Pubblica scheda di prova
-        if: github.event_name == 'workflow_dispatch' && env.PIPELINE_MODE == 'dry-run'
+        if: env.MANUAL == 'true' && env.PIPELINE_MODE == 'dry-run'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scheda-prova
@@ -120,7 +143,25 @@ jobs:
           retention-days: 3
 
       - name: Mantieni attiva la pianificazione
-        if: github.event_name == 'schedule' && github.event.schedule == '41 4 * * 1'
+        if: always() && (vars.PIPELINE_MODE == 'collect' || vars.PIPELINE_MODE == 'live')
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/pipeline.yml/enable"
+
+      # Anche dopo un errore: la catena non deve fermarsi (gli avvisi gestiscono i guasti).
+      # Si interrompe impostando PIPELINE_MODE=dry-run. Con la concorrenza, al massimo
+      # un ciclo in attesa: un avvio duplicato sostituisce quello pendente.
+      - name: Avvia il ciclo successivo
+        if: always() && (vars.PIPELINE_MODE == 'collect' || vars.PIPELINE_MODE == 'live') && env.PIPELINE_MODE == vars.PIPELINE_MODE
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          hour=$(TZ=Europe/Rome date +%H)
+          if [ "$hour" -ge 22 ] || [ "$hour" -lt 7 ]; then cadence=notte; else cadence=giorno; fi
+          for attempt in 1 2 3; do
+            gh workflow run pipeline.yml --repo "${{ github.repository }}" --ref main \
+              -f chained=true -f cadence="$cadence" && echo "Prossimo ciclo: $cadence" && exit 0
+            sleep $((attempt * 10))
+          done
+          echo "::warning::Ciclo successivo non avviato: riparte con il cron di riserva"
