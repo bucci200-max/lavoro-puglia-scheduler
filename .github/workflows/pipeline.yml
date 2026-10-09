@@ -21,6 +21,15 @@ on:
         type: choice
         options: ['', 'dry-run', 'collect', 'live']
         default: ''
+      card_template:
+        description: 'Scheda Telegram (vuoto = variabile CARD_TEMPLATE, poi v1)'
+        type: choice
+        options: ['', 'v1', 'v2']
+        default: ''
+      pipeline_ref:
+        description: 'Ramo del codice pipeline da provare (solo collaudi dry-run)'
+        type: string
+        default: 'main'
       chained:
         description: 'Uso interno: ciclo avviato dal ciclo precedente'
         type: boolean
@@ -35,8 +44,10 @@ permissions:
   actions: write # avviare il ciclo successivo e riattivare la pianificazione
   deployments: write # attesa tramite environment
 
+# I collaudi dry-run (nessuna scrittura, nessun invio) non entrano nella coda dei
+# cicli reali, così non possono sostituire o bloccare un anello della catena.
 concurrency:
-  group: lavoro-puglia-pipeline
+  group: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run') && 'lavoro-puglia-collaudo' || 'lavoro-puglia-pipeline' }}
   cancel-in-progress: false
 
 jobs:
@@ -60,11 +71,14 @@ jobs:
     env:
       PIPELINE_MODE: ${{ inputs.mode || vars.PIPELINE_MODE || 'dry-run' }}
       MANUAL: ${{ github.event_name == 'workflow_dispatch' && !inputs.chained }}
+      CARD_TEMPLATE: ${{ inputs.card_template || vars.CARD_TEMPLATE || 'v1' }}
     steps:
       - name: Checkout pipeline (privato, deploy key in sola lettura)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: bucci200-max/lavoro-puglia-pipeline
+          # Rami diversi da main solo nei collaudi dry-run manuali.
+          ref: ${{ (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run' && inputs.pipeline_ref) || 'main' }}
           ssh-key: ${{ secrets.PIPELINE_DEPLOY_KEY }}
           persist-credentials: false
           path: pipeline
@@ -130,16 +144,23 @@ jobs:
           key: run-state-${{ github.run_id }}
 
       - name: Scheda di prova (solo dry-run manuale)
-        if: env.MANUAL == 'true' && env.PIPELINE_MODE == 'dry-run'
+        if: env.MANUAL == 'true' && env.PIPELINE_MODE == 'dry-run' && env.CARD_TEMPLATE != 'v2'
         working-directory: pipeline
         run: npx tsx functions/cli.ts card --out card-preview/scheda-prova.png
+
+      - name: Anteprime banner v2 su offerte reali (sola lettura, solo dry-run manuale)
+        if: env.MANUAL == 'true' && env.PIPELINE_MODE == 'dry-run' && env.CARD_TEMPLATE == 'v2'
+        working-directory: pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: npx tsx scripts/banner-previews.ts --out card-preview
 
       - name: Pubblica scheda di prova
         if: env.MANUAL == 'true' && env.PIPELINE_MODE == 'dry-run'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scheda-prova
-          path: pipeline/card-preview/scheda-prova.png
+          path: pipeline/card-preview/
           retention-days: 3
 
       - name: Mantieni attiva la pianificazione
