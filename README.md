@@ -1,6 +1,7 @@
 # Lavoro Puglia — scheduler
 
-Questo repository contiene **solo** il workflow GitHub Actions che avvia, circa ogni 15 minuti,
+Questo repository contiene **solo** il workflow GitHub Actions che avvia, ogni 12 minuti di giorno
+e ogni 30 di notte (ora di Roma),
 la pipeline di raccolta e pubblicazione delle offerte di lavoro di
 [Lavoro Puglia](https://t.me/lavoropuglia26).
 
